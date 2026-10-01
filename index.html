@@ -95,6 +95,23 @@ button:disabled { opacity: 0.55; cursor: progress; }
 .mint { color: var(--mint); }
 .empty { padding-block: 40px; text-align: center; color: var(--muted); }
 @media (prefers-reduced-motion: no-preference) { .card { transition: transform .15s; } .card:hover { transform: translateY(-2px); } }
+
+.bar { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.bar .status { flex: 1 1 auto; min-width: 0; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-block: 12px 0; }
+.seg button { background: var(--surface); color: var(--muted); border-radius: 0; padding: 6px 14px; font-size: 13px; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+table { width: 100%; border-collapse: collapse; font: 400 13px var(--mono); font-variant-numeric: tabular-nums; }
+th { text-align: left; font: 700 10px var(--display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+td a { color: var(--fg); }
+td a:hover { color: var(--accent); }
+td.thumb { width: 52px; padding-right: 0; }
+td.thumb img { width: 40px; height: 40px; border-radius: 8px; object-fit: cover; display: block; background: var(--line); }
+td.id { font-weight: 500; }
 </style>
 </head>
 <body>
@@ -114,9 +131,15 @@ button:disabled { opacity: 0.55; cursor: progress; }
     <button id="go" type="submit">Look up</button>
   </form>
 
-  <div class="status" id="status"></div>
+  <div class="bar">
+    <div class="status" id="status"></div>
+    <div class="seg" role="group" aria-label="View">
+      <button type="button" id="view-grid" aria-pressed="true">Grid</button>
+      <button type="button" id="view-list" aria-pressed="false">List</button>
+    </div>
+  </div>
   <div class="senders" id="senders"></div>
-  <div class="grid" id="grid"></div>
+  <div id="results"></div>
 </div>
 
 <script>
@@ -126,70 +149,121 @@ const ZERO = "0x0000000000000000000000000000000000000000";
 const GATEWAYS = ["https://ipfs.io/ipfs/", "https://gateway.pinata.cloud/ipfs/", "https://dweb.link/ipfs/"];
 const isAddr = s => /^0x[0-9a-fA-F]{40}$/.test(s);
 const short = a => a.slice(0, 6) + "…" + a.slice(-4);
+const lc = s => (s || "").toLowerCase();
 const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const nftUrl = id => `https://basescan.org/nft/${CONTRACT}/${id}`;
+const addrUrl = a => `https://basescan.org/address/${a}`;
 
-let state = null; // { owner, tokens: [{id, name, ipfs, image, from, fromEns, time}] }
+let state = null; // { owner, tokens: [{id, name, from, via, time, tx}] }
 let runId = 0;
+let view = "grid";
+try { if (localStorage.getItem("view") === "list") view = "list"; } catch {}
 
-async function getJSON(url, tries = 5) {
-  for (let i = 0; i < tries; i++) {
-    const r = await fetch(url);
+const RPC = "https://mainnet.base.org";
+const IMAGE_CID = "bafybeidxclt74frtmiuiisfquphn2qdukz2cg63cr7bwyblp3mfwr5gk6a";
+
+// Blockscout's anonymous limit is per IP; keep requests spaced and back off on 429.
+let lastReq = 0;
+async function getJSON(url, init) {
+  for (let i = 0; i < 6; i++) {
+    const wait = lastReq + 250 - Date.now();
+    lastReq = Math.max(Date.now(), lastReq + 250);
+    if (wait > 0) await sleep(wait);
+    const r = await fetch(url, init);
     if (r.ok) return r.json();
-    if (r.status === 429 || r.status >= 500) { await new Promise(res => setTimeout(res, 800 * (i + 1))); continue; }
-    throw new Error(`Blockscout returned ${r.status}`);
+    if (r.status === 429 || r.status >= 500) { await sleep(1500 * 2 ** i); continue; }
+    throw new Error(`${new URL(url).host} returned ${r.status}`);
   }
-  throw new Error("Blockscout is rate-limiting requests. Try again in a minute.");
+  throw new Error("Too many requests to Blockscout. Try again in a few minutes.");
 }
 
-// Follows Blockscout's keyset pagination until exhausted.
-async function paginate(path, params, onPage) {
-  let next = null;
-  do {
-    const q = new URLSearchParams({ ...params, ...(next || {}) });
-    const d = await getJSON(`${API}${path}?${q}`);
-    onPage(d.items || []);
-    next = d.next_page_params;
-  } while (next);
+// Every transfer of this collection into or out of addr, newest first. Cached per address.
+const histCache = new Map();
+function transfersOf(addr) {
+  const k = lc(addr);
+  if (!histCache.has(k)) {
+    histCache.set(k, (async () => {
+      const rows = [];
+      for (let page = 1; ; page++) {
+        const q = new URLSearchParams({ module: "account", action: "tokennfttx", contractaddress: CONTRACT, address: addr, page, offset: 10000, sort: "desc" });
+        const d = await getJSON(`https://base.blockscout.com/api?${q}`);
+        const res = Array.isArray(d.result) ? d.result : [];
+        if (d.status !== "1" && !/no token transfers/i.test(d.message || "")) throw new Error(`Blockscout: ${d.message || "bad response"}`);
+        for (const r of res) rows.push({ id: r.tokenID, from: lc(r.from), to: lc(r.to), hash: r.hash, block: +r.blockNumber, txi: +r.transactionIndex, time: +r.timeStamp });
+        if (res.length < 10000) break;
+      }
+      return rows;
+    })().catch(e => { histCache.delete(k); throw e; }));
+  }
+  return histCache.get(k);
+}
+
+// Address kind from bytecode: "eoa", "7702" (delegated user wallet) or "contract". Cached.
+const kindCache = new Map();
+async function classify(addrs) {
+  const todo = [...new Set(addrs.map(lc))].filter(a => !kindCache.has(a));
+  for (let i = 0; i < todo.length; i += 10) {
+    const chunk = todo.slice(i, i + 10);
+    const body = chunk.map((a, j) => ({ jsonrpc: "2.0", id: j, method: "eth_getCode", params: [a, "latest"] }));
+    const res = await getJSON(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!Array.isArray(res)) throw new Error(`Base RPC: ${res?.error?.message || "bad response"}`);
+    for (const r of res) {
+      const code = r.result || "0x";
+      kindCache.set(chunk[r.id], code === "0x" ? "eoa" : code.startsWith("0xef0100") ? "7702" : "contract");
+    }
+  }
+}
+const isContract = a => kindCache.get(a) === "contract";
+
+// Most recent transfer of token tid into addr that happened before ref.
+function priorIn(rows, addr, tid, ref) {
+  return rows.find(r => r.id === tid && r.to === addr && r !== ref &&
+    (r.block < ref.block || (r.block === ref.block && r.txi <= ref.txi)) &&
+    !(r.hash === ref.hash && r.from === ref.from && r.to === ref.to));
 }
 
 async function load(owner) {
   const id = ++runId;
-  const held = new Map();
-  const lastIn = new Map();
-  let pages = 0;
-  const tick = () => { if (id === runId) setStatus(`Loading… ${held.size} held · ${lastIn.size} incoming transfers · ${++pages} pages`); };
+  const me = lc(owner);
+  const live = () => id === runId;
+  setStatus("Loading transfers…");
+  const mine = await transfersOf(owner);
+  if (!live()) return null;
 
-  await Promise.all([
-    paginate(`/tokens/${CONTRACT}/instances`, { holder_address_hash: owner }, items => {
-      for (const t of items) held.set(t.id, t);
-      tick();
-    }),
-    // Newest first, so the first transfer seen per token is the one that delivered it to the current owner.
-    paginate(`/addresses/${owner}/token-transfers`, { type: "ERC-721", filter: "to", token: CONTRACT }, items => {
-      for (const t of items) {
-        const tid = t.total?.token_id;
-        if (tid != null && !lastIn.has(tid)) lastIn.set(tid, t);
+  // The newest transfer per token decides whether the owner still holds it.
+  const seen = new Set();
+  const tokens = [];
+  for (const r of mine) {
+    if (seen.has(r.id)) continue;
+    seen.add(r.id);
+    if (r.to !== me) continue;
+    tokens.push({ id: r.id, name: `Kemonokaki #${r.id}`, from: null, via: [], time: r.time, tx: r.hash, _cur: r.from, _ref: r });
+  }
+
+  // Walk each token back past contracts (and the owner's own earlier hops) to the wallet that sent it.
+  for (let round = 0; round < 8; round++) {
+    await classify(tokens.map(t => t._cur));
+    if (!live()) return null;
+    const waiting = tokens.filter(t => !t._stuck && (isContract(t._cur) || t._cur === me));
+    if (!waiting.length) break;
+    const addrs = [...new Set(waiting.map(t => t._cur))];
+    for (const [i, a] of addrs.entries()) {
+      setStatus(`Tracing past contracts… ${i + 1}/${addrs.length}`);
+      const rows = await transfersOf(a);
+      if (!live()) return null;
+      for (const t of waiting.filter(t => t._cur === a)) {
+        const prev = priorIn(rows, a, t.id, t._ref);
+        if (!prev) { t._stuck = true; continue; }
+        if (isContract(a)) t.via.push(a);
+        t._cur = prev.from;
+        t._ref = prev;
       }
-      tick();
-    }),
-  ]);
-  if (id !== runId) return null;
+    }
+  }
 
-  const tokens = [...held.values()].map(t => {
-    const tx = lastIn.get(t.id);
-    const media = t.media_url || t.metadata?.image || "";
-    return {
-      id: t.id,
-      name: t.metadata?.name || `Kemonokaki #${t.id}`,
-      ipfs: media.startsWith("ipfs://") ? media.slice(7) : null,
-      image: t.image_url || media,
-      from: tx ? tx.from.hash : null,
-      fromEns: tx ? tx.from.ens_domain_name : null,
-      time: tx ? tx.timestamp : null,
-      tx: tx ? tx.transaction_hash : null,
-    };
-  });
-  tokens.sort((a, b) => (b.time || "").localeCompare(a.time || "") || Number(a.id) - Number(b.id));
+  for (const t of tokens) { t.from = t._cur; delete t._cur; delete t._ref; delete t._stuck; }
+  tokens.sort((a, b) => b.time - a.time || Number(a.id) - Number(b.id));
   return { owner, tokens };
 }
 
@@ -198,64 +272,101 @@ function setStatus(html, isErr) {
 }
 
 function imgSrcs(t) {
-  const list = t.ipfs ? GATEWAYS.map(g => g + t.ipfs) : [];
-  if (t.image && !list.includes(t.image)) list.push(t.image);
-  return list;
+  return [".png", ".gif"].flatMap(ext => GATEWAYS.map(g => `${g}${IMAGE_CID}/${t.id}${ext}`));
+}
+function attachImg(img, t) {
+  const srcs = imgSrcs(t);
+  let i = 0;
+  img.onerror = () => { if (++i < srcs.length) img.src = srcs[i]; };
+  if (srcs.length) img.src = srcs[0];
+}
+
+const fromHtml = t => !t.from ? `<span>unknown</span>`
+  : t.from === ZERO ? `<span class="mint">Minted</span>`
+  : `<a href="${addrUrl(t.from)}" target="_blank" rel="noopener" title="${t.from}">${short(t.from)}</a>`;
+const viaHtml = t => t.via.map(a => `<a href="${addrUrl(a)}" target="_blank" rel="noopener" title="${a}">${short(a)}</a>`).join(" · ");
+const whenHtml = t => {
+  const when = t.time ? new Date(t.time * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
+  return t.tx ? `<a href="https://basescan.org/tx/${t.tx}" target="_blank" rel="noopener">${when}</a>` : when;
+};
+
+function renderGrid(shown) {
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  for (const t of shown) {
+    const card = document.createElement("article");
+    card.className = "card";
+    card.innerHTML = `
+      <div class="img"><img loading="lazy" alt="${t.name}"></div>
+      <div class="body">
+        <div class="name"><a href="${nftUrl(t.id)}" target="_blank" rel="noopener">#${t.id}</a></div>
+        <div class="row"><span class="k">Previous owner</span><span class="v">${fromHtml(t)}</span></div>
+        ${t.via.length ? `<div class="row"><span class="k">Via contract</span><span class="v">${viaHtml(t)}</span></div>` : ""}
+        <div class="row"><span class="k">Received</span><span class="v">${whenHtml(t)}</span></div>
+      </div>`;
+    attachImg(card.querySelector("img"), t);
+    grid.append(card);
+  }
+  return grid;
+}
+
+function renderList(shown) {
+  const wrap = document.createElement("div");
+  wrap.className = "table-wrap";
+  wrap.innerHTML = `<table><thead><tr><th></th><th>Token</th><th>Previous owner</th><th>Via contract</th><th>Received</th><th>BaseScan</th></tr></thead><tbody></tbody></table>`;
+  const body = wrap.querySelector("tbody");
+  for (const t of shown) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="thumb"><img loading="lazy" alt="${t.name}"></td>
+      <td class="id">#${t.id}</td>
+      <td>${fromHtml(t)}</td>
+      <td>${viaHtml(t) || "—"}</td>
+      <td>${whenHtml(t)}</td>
+      <td><a href="${nftUrl(t.id)}" target="_blank" rel="noopener">View NFT</a></td>`;
+    attachImg(tr.querySelector("img"), t);
+    body.append(tr);
+  }
+  return wrap;
 }
 
 function render() {
-  const grid = $("grid"), senders = $("senders");
-  grid.innerHTML = ""; senders.innerHTML = "";
+  const results = $("results"), senders = $("senders");
+  results.innerHTML = ""; senders.innerHTML = "";
   if (!state) return;
-  const prev = $("prev").value.trim().toLowerCase();
-  const shown = prev ? state.tokens.filter(t => (t.from || "").toLowerCase() === prev) : state.tokens;
+  const prev = lc($("prev").value.trim());
+  const shown = prev ? state.tokens.filter(t => lc(t.from) === prev) : state.tokens;
 
   const counts = new Map();
   for (const t of state.tokens) {
-    const k = t.from || "unknown";
-    const c = counts.get(k) || { n: 0, ens: t.fromEns };
-    c.n++; counts.set(k, c);
+    if (!t.from) continue;
+    const c = counts.get(t.from) || { n: 0 };
+    c.n++; counts.set(t.from, c);
   }
   [...counts.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 40).forEach(([addr, c]) => {
-    if (addr === "unknown") return;
     const b = document.createElement("button");
     b.type = "button"; b.className = "chip";
-    b.setAttribute("aria-pressed", String(addr.toLowerCase() === prev));
-    b.innerHTML = `${addr === ZERO ? "Minted" : (c.ens || short(addr))}<b>${c.n}</b>`;
+    b.setAttribute("aria-pressed", String(lc(addr) === prev));
+    b.innerHTML = `${addr === ZERO ? "Minted" : short(addr)}<b>${c.n}</b>`;
     b.title = addr;
     b.onclick = () => {
-      $("prev").value = addr.toLowerCase() === prev ? "" : addr;
+      $("prev").value = lc(addr) === prev ? "" : addr;
       syncUrl(); render();
     };
     senders.append(b);
   });
 
-  setStatus(`<strong>${shown.length}</strong>&nbsp;shown · ${state.tokens.length} held by ${short(state.owner)} · ${counts.size} previous owners`);
-  if (!shown.length) { grid.innerHTML = `<div class="empty">No matches</div>`; return; }
+  setStatus(`<strong>${shown.length}</strong>&nbsp;shown · ${state.tokens.length} held by ${short(state.owner)} · ${counts.size} previous owner${counts.size === 1 ? "" : "s"}`);
+  if (!shown.length) { results.innerHTML = `<div class="empty">No matches</div>`; return; }
+  results.append(view === "list" ? renderList(shown) : renderGrid(shown));
+}
 
-  const frag = document.createDocumentFragment();
-  for (const t of shown) {
-    const card = document.createElement("article");
-    card.className = "card";
-    const srcs = imgSrcs(t);
-    const from = !t.from ? `<span>unknown</span>`
-      : t.from === ZERO ? `<span class="mint">Minted</span>`
-      : `<a href="https://basescan.org/address/${t.from}" target="_blank" rel="noopener" title="${t.from}">${t.fromEns || short(t.from)}</a>`;
-    const when = t.time ? new Date(t.time).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
-    card.innerHTML = `
-      <div class="img"><img loading="lazy" alt="${t.name}"></div>
-      <div class="body">
-        <div class="name"><a href="https://opensea.io/item/base/${CONTRACT}/${t.id}" target="_blank" rel="noopener">#${t.id}</a></div>
-        <div class="row"><span class="k">Previous owner</span><span class="v">${from}</span></div>
-        <div class="row"><span class="k">Received</span><span class="v">${t.tx ? `<a href="https://basescan.org/tx/${t.tx}" target="_blank" rel="noopener">${when}</a>` : when}</span></div>
-      </div>`;
-    const img = card.querySelector("img");
-    let i = 0;
-    img.onerror = () => { if (++i < srcs.length) img.src = srcs[i]; };
-    if (srcs.length) img.src = srcs[0];
-    frag.append(card);
-  }
-  grid.append(frag);
+function setView(v) {
+  view = v;
+  $("view-grid").setAttribute("aria-pressed", String(v === "grid"));
+  $("view-list").setAttribute("aria-pressed", String(v === "list"));
+  try { localStorage.setItem("view", v); } catch {}
+  render();
 }
 
 function syncUrl() {
@@ -275,7 +386,7 @@ async function run() {
   if (prev && !isAddr(prev)) return setStatus("Previous owner must be a 0x address (42 characters).", true);
   syncUrl();
 
-  if (state && state.owner.toLowerCase() === owner.toLowerCase()) return render();
+  if (state && lc(state.owner) === lc(owner)) return render();
   state = null; render();
   $("go").disabled = true;
   try {
@@ -293,6 +404,9 @@ $("prev").addEventListener("input", () => {
   const v = $("prev").value.trim();
   if (state && (!v || isAddr(v))) { $("prev").setAttribute("aria-invalid", "false"); syncUrl(); render(); }
 });
+$("view-grid").onclick = () => setView("grid");
+$("view-list").onclick = () => setView("list");
+setView(view);
 
 const params = new URLSearchParams(location.search);
 $("owner").value = params.get("owner") || "";
