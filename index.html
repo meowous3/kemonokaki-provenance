@@ -46,7 +46,7 @@ h1 span { color: var(--accent); }
 .meta { font: 400 12px/1.4 var(--mono); color: var(--muted); }
 .meta a { color: inherit; }
 
-form {
+#q {
   position: sticky; top: 0; z-index: 5;
   display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end;
   background: var(--bg); padding-block: 12px; border-bottom: 1px solid var(--line);
@@ -63,7 +63,14 @@ button {
   padding: 11px 20px; background: var(--accent); color: var(--accent-ink);
 }
 button:disabled { opacity: 0.55; cursor: progress; }
-@media (max-width: 720px) { form { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { #q { grid-template-columns: 1fr; } }
+.field { display: grid; gap: 4px; min-width: 0; }
+.field > .lbl { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+#owners { display: grid; gap: 6px; }
+.owner-row { display: flex; gap: 6px; min-width: 0; }
+.owner-row input { flex: 1 1 auto; }
+.icon { background: var(--surface); color: var(--muted); border: 1px solid var(--line); padding: 0 12px; font-size: 18px; line-height: 1; }
+.icon:hover { color: var(--fg); }
 
 .status { min-height: 22px; padding-block: 14px 4px; font: 400 13px var(--mono); color: var(--muted); display: flex; gap: 16px; flex-wrap: wrap; }
 .status strong { color: var(--fg); font-weight: 500; }
@@ -132,9 +139,10 @@ td.id { font-weight: 500; }
   </header>
 
   <form id="q" autocomplete="off">
-    <label for="owner">Current owner
-      <input id="owner" name="owner" placeholder="0x…" spellcheck="false" required>
-    </label>
+    <div class="field">
+      <span class="lbl" id="owners-label">Current owners</span>
+      <div id="owners" role="group" aria-labelledby="owners-label"></div>
+    </div>
     <label for="prev">Previous owner
       <input id="prev" name="prev" placeholder="0x… (optional)" spellcheck="false">
     </label>
@@ -164,7 +172,7 @@ td.id { font-weight: 500; }
 const CONTRACT = "0xee7d1b184be8185adc7052635329152a4d0cdefa";
 const ZERO = "0x0000000000000000000000000000000000000000";
 const IMAGE_CID = "bafybeidxclt74frtmiuiisfquphn2qdukz2cg63cr7bwyblp3mfwr5gk6a";
-const GATEWAYS = ["https://ipfs.io/ipfs/", "https://gateway.pinata.cloud/ipfs/", "https://dweb.link/ipfs/"];
+const GATEWAY = "https://ipfs.filebase.io/ipfs/";
 const isAddr = s => /^0x[0-9a-fA-F]{40}$/.test(s);
 const short = a => a.slice(0, 6) + "…" + a.slice(-4);
 const lc = s => (s || "").toLowerCase();
@@ -179,7 +187,7 @@ try { const s = JSON.parse(localStorage.getItem("skip")); if (Array.isArray(s)) 
 const nftUrl = id => `https://basescan.org/nft/${CONTRACT}/${id}`;
 const addrUrl = a => `https://basescan.org/address/${a}`;
 
-let state = null; // { owner, tokens: [{id, name, from, time, tx}] }
+let state = null; // { owners, tokens: [{id, name, owner, from, time, tx}] }
 let view = "grid";
 try { if (localStorage.getItem("view") === "list") view = "list"; } catch {}
 
@@ -221,10 +229,15 @@ function compute(owner, { rows, kinds }) {
       cur = prev.from;
       ref = prev;
     }
-    tokens.push({ id: r.id, name: `Kemonokaki #${r.id}`, from: cur, time: r.time, tx: r.hash });
+    tokens.push({ id: r.id, name: `Kemonokaki #${r.id}`, owner: me, from: cur, time: r.time, tx: r.hash });
   }
+  return tokens;
+}
+
+function computeAll(owners, data) {
+  const tokens = owners.flatMap(o => compute(o, data));
   tokens.sort((a, b) => b.time - a.time || Number(a.id) - Number(b.id));
-  return { owner, tokens };
+  return { owners, tokens };
 }
 
 function setStatus(html, isErr) {
@@ -232,7 +245,8 @@ function setStatus(html, isErr) {
 }
 
 function imgSrcs(t) {
-  return [".png", ".gif"].flatMap(ext => GATEWAYS.map(g => `${g}${IMAGE_CID}/${t.id}${ext}`));
+  // Mirrored by scripts/update.mjs; the gateway covers anything not mirrored yet.
+  return [`images/${t.id}.png`, `images/${t.id}.gif`, `${GATEWAY}${IMAGE_CID}/${t.id}.png`, `${GATEWAY}${IMAGE_CID}/${t.id}.gif`];
 }
 function attachImg(img, t) {
   const srcs = imgSrcs(t);
@@ -249,7 +263,7 @@ const whenHtml = t => {
   return t.tx ? `<a href="https://basescan.org/tx/${t.tx}" target="_blank" rel="noopener">${when}</a>` : when;
 };
 
-function renderGrid(shown) {
+function renderGrid(shown, multi) {
   const grid = document.createElement("div");
   grid.className = "grid";
   for (const t of shown) {
@@ -259,6 +273,7 @@ function renderGrid(shown) {
       <div class="img"><img loading="lazy" alt="${t.name}"></div>
       <div class="body">
         <div class="name"><a href="${nftUrl(t.id)}" target="_blank" rel="noopener">#${t.id}</a></div>
+        ${multi ? `<div class="row"><span class="k">Current owner</span><span class="v"><a href="${addrUrl(t.owner)}" target="_blank" rel="noopener">${t.owner}</a></span></div>` : ""}
         <div class="row"><span class="k">Previous owner</span><span class="v">${fromHtml(t)}</span></div>
         <div class="row"><span class="k">Received</span><span class="v">${whenHtml(t)}</span></div>
       </div>`;
@@ -268,16 +283,17 @@ function renderGrid(shown) {
   return grid;
 }
 
-function renderList(shown) {
+function renderList(shown, multi) {
   const wrap = document.createElement("div");
   wrap.className = "table-wrap";
-  wrap.innerHTML = `<table><thead><tr><th></th><th>Token</th><th>Previous owner</th><th>Received</th><th>BaseScan</th></tr></thead><tbody></tbody></table>`;
+  wrap.innerHTML = `<table><thead><tr><th></th><th>Token</th>${multi ? "<th>Current owner</th>" : ""}<th>Previous owner</th><th>Received</th><th>BaseScan</th></tr></thead><tbody></tbody></table>`;
   const body = wrap.querySelector("tbody");
   for (const t of shown) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td class="thumb"><img loading="lazy" alt="${t.name}"></td>
       <td class="id">#${t.id}</td>
+      ${multi ? `<td><a href="${addrUrl(t.owner)}" target="_blank" rel="noopener">${t.owner}</a></td>` : ""}
       <td>${fromHtml(t)}</td>
       <td>${whenHtml(t)}</td>
       <td><a href="${nftUrl(t.id)}" target="_blank" rel="noopener">View NFT</a></td>`;
@@ -313,9 +329,10 @@ function render() {
     senders.append(b);
   });
 
-  setStatus(`<strong>${shown.length}</strong>&nbsp;shown · ${state.tokens.length} received by ${short(state.owner)} in 7 days · ${counts.size} previous owner${counts.size === 1 ? "" : "s"}`);
+  setStatus(`<strong>${shown.length}</strong>&nbsp;shown · ${state.tokens.length} received by ${state.owners.length === 1 ? state.owners[0] : `${state.owners.length} wallets`} in 7 days · ${counts.size} previous owner${counts.size === 1 ? "" : "s"}`);
   if (!shown.length) { results.innerHTML = `<div class="empty">No matches</div>`; return; }
-  results.append(view === "list" ? renderList(shown) : renderGrid(shown));
+  const multi = state.owners.length > 1;
+  results.append(view === "list" ? renderList(shown, multi) : renderGrid(shown, multi));
 }
 
 function setView(v) {
@@ -328,27 +345,35 @@ function setView(v) {
 
 function syncUrl() {
   const p = new URLSearchParams();
-  const o = $("owner").value.trim(), v = $("prev").value.trim();
+  const o = ownerInputs().map(i => i.value.trim()).filter(Boolean).join(","), v = $("prev").value.trim();
   if (o) p.set("owner", o);
   if (v) p.set("prev", v);
   history.replaceState(null, "", p.toString() ? `?${p}` : location.pathname);
 }
 
 async function run() {
-  const owner = $("owner").value.trim();
+  const inputs = ownerInputs();
+  let bad = 0;
+  for (const i of inputs) {
+    const v = i.value.trim();
+    const ok = !v || isAddr(v);
+    i.setAttribute("aria-invalid", String(!ok));
+    if (!ok) bad++;
+  }
+  const owners = [...new Set(inputs.map(i => lc(i.value.trim())).filter(isAddr))];
   const prev = $("prev").value.trim();
-  $("owner").setAttribute("aria-invalid", String(!isAddr(owner)));
   $("prev").setAttribute("aria-invalid", String(!!prev && !isAddr(prev)));
-  if (!isAddr(owner)) return setStatus("Current owner must be a 0x address (42 characters).", true);
+  if (bad) return setStatus("Current owners must be 0x addresses (42 characters).", true);
+  if (!owners.length) return setStatus("Enter a current owner.", true);
   if (prev && !isAddr(prev)) return setStatus("Previous owner must be a 0x address (42 characters).", true);
   syncUrl();
 
-  if (state && lc(state.owner) === lc(owner)) return render();
+  if (state && state.owners.join() === owners.join()) return render();
   state = null; render();
   setStatus("Loading…");
   $("go").disabled = true;
   try {
-    state = compute(owner, await loadData());
+    state = computeAll(owners, await loadData());
     render();
   } catch (e) {
     setStatus(`${e.message}`, true);
@@ -376,7 +401,7 @@ function renderSkip() {
 async function skipChanged() {
   try { localStorage.setItem("skip", JSON.stringify([...skip])); } catch {}
   renderSkip();
-  if (state) { state = compute(state.owner, await loadData()); render(); }
+  if (state) { state = computeAll(state.owners, await loadData()); render(); }
 }
 $("skip").addEventListener("submit", e => {
   e.preventDefault();
@@ -395,10 +420,42 @@ $("view-grid").onclick = () => setView("grid");
 $("view-list").onclick = () => setView("list");
 setView(view);
 
+const ownerInputs = () => [...$("owners").querySelectorAll("input")];
+let ownerSeq = 0;
+function addOwner(value = "", after = null) {
+  const row = document.createElement("div");
+  row.className = "owner-row";
+  const id = `owner-${ownerSeq++}`;
+  row.innerHTML = `<input id="${id}" placeholder="0x…" spellcheck="false" aria-label="Current owner"><button type="button" class="icon" aria-label="Remove owner">×</button>`;
+  const input = row.querySelector("input");
+  input.value = value;
+  // Pasting several addresses into one field spreads them over separate fields.
+  input.addEventListener("input", () => {
+    const found = input.value.match(/0x[0-9a-fA-F]{40}/g) || [];
+    if (found.length < 2) return;
+    input.value = found[0];
+    let last = row;
+    for (const a of found.slice(1)) last = addOwner(a, last);
+  });
+  row.querySelector("button").onclick = () => {
+    if (ownerInputs().length > 1) row.remove(); else input.value = "";
+    if (state) run();
+  };
+  if (after) after.after(row); else $("owners").insertBefore(row, $("owner-add"));
+  return row;
+}
+const addBtn = document.createElement("button");
+addBtn.type = "button"; addBtn.id = "owner-add"; addBtn.className = "icon"; addBtn.textContent = "+";
+addBtn.setAttribute("aria-label", "Add owner");
+addBtn.style.justifySelf = "start";
+addBtn.onclick = () => addOwner().querySelector("input").focus();
+$("owners").append(addBtn);
+
 const params = new URLSearchParams(location.search);
-$("owner").value = params.get("owner") || "";
+const initial = (params.get("owner") || "").split(/[\s,]+/).filter(Boolean);
+for (const a of initial.length ? initial : [""]) addOwner(a);
 $("prev").value = params.get("prev") || "";
-if ($("owner").value) run();
+if (initial.length) run();
 loadData().then(d => {
   $("asof").textContent = "Data to " + new Date(d.toTime * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }, e => setStatus(e.message, true));
