@@ -69,6 +69,16 @@ button:disabled { opacity: 0.55; cursor: progress; }
 .status strong { color: var(--fg); font-weight: 500; }
 .status .err { color: var(--warn); }
 
+.skip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-block: 10px; border-bottom: 1px solid var(--line); }
+.skip .k { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-right: 4px; }
+.skip .chip { cursor: default; display: inline-flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+.skip .chip a { color: var(--fg); }
+.skip .chip a:hover { color: var(--accent); }
+.skip .chip button { background: none; color: var(--muted); padding: 0 2px; font: 700 14px/1 var(--display); border-radius: 4px; }
+.skip .chip button:hover { color: var(--warn); }
+.skip input { width: 25em; max-width: 100%; padding: 5px 10px; font-size: 12px; border-radius: 999px; }
+.skip .small { padding: 5px 12px; font-size: 12px; border-radius: 999px; }
+.skip .ghost { background: var(--surface); color: var(--muted); border: 1px solid var(--line); }
 .senders { display: flex; flex-wrap: wrap; gap: 6px; padding-block: 6px 16px; }
 .chip {
   font: 400 12px var(--mono); color: var(--fg); background: var(--surface);
@@ -131,6 +141,14 @@ td.id { font-weight: 500; }
     <button id="go" type="submit">Look up</button>
   </form>
 
+  <form class="skip" id="skip" autocomplete="off">
+    <span class="k">Skip</span>
+    <span id="skip-list" style="display:contents"></span>
+    <input id="skip-add" placeholder="0x…" spellcheck="false" aria-label="Address to skip">
+    <button class="small" type="submit">Add</button>
+    <button class="small ghost" type="button" id="skip-reset">Reset</button>
+  </form>
+
   <div class="bar">
     <div class="status" id="status"></div>
     <div class="seg" role="group" aria-label="View">
@@ -151,10 +169,17 @@ const isAddr = s => /^0x[0-9a-fA-F]{40}$/.test(s);
 const short = a => a.slice(0, 6) + "…" + a.slice(-4);
 const lc = s => (s || "").toLowerCase();
 const $ = id => document.getElementById(id);
+// Wallets that only pass NFTs along; stepped over like contracts when finding the previous owner.
+const DEFAULT_SKIP = [
+  "0xc49c946586b1c686a8ea5bb423b81a5efcd51ffc",
+  "0xe4ea4abf707118abf2269badec1950abeffd6907",
+];
+let skip = new Set(DEFAULT_SKIP);
+try { const s = JSON.parse(localStorage.getItem("skip")); if (Array.isArray(s)) skip = new Set(s.filter(isAddr).map(lc)); } catch {}
 const nftUrl = id => `https://basescan.org/nft/${CONTRACT}/${id}`;
 const addrUrl = a => `https://basescan.org/address/${a}`;
 
-let state = null; // { owner, tokens: [{id, name, from, via, time, tx}] }
+let state = null; // { owner, tokens: [{id, name, from, time, tx}] }
 let view = "grid";
 try { if (localStorage.getItem("view") === "list") view = "list"; } catch {}
 
@@ -179,7 +204,7 @@ const before = (a, b) => a.block < b.block || (a.block === b.block && a.li < b.l
 
 function compute(owner, { rows, kinds }) {
   const me = lc(owner);
-  const isContract = a => kinds[a] === "c";
+  const passThrough = a => kinds[a] === "c" || skip.has(a);
 
   // The newest transfer per token decides who holds it.
   const seen = new Set();
@@ -189,16 +214,14 @@ function compute(owner, { rows, kinds }) {
     seen.add(r.id);
     if (r.to !== me) continue;
     let cur = r.from, ref = r;
-    const via = [];
-    // Walk back past contracts (and the owner's own earlier hops) to the wallet that sent it.
-    for (let hop = 0; hop < 16 && (isContract(cur) || cur === me); hop++) {
+    // Walk back past contracts, skipped wallets and the owner's own earlier hops to the wallet that sent it.
+    for (let hop = 0; hop < 16 && (passThrough(cur) || cur === me); hop++) {
       const prev = rows.find(p => p.id === r.id && p.to === cur && before(p, ref));
       if (!prev) break;
-      if (isContract(cur)) via.push(cur);
       cur = prev.from;
       ref = prev;
     }
-    tokens.push({ id: r.id, name: `Kemonokaki #${r.id}`, from: cur, via, time: r.time, tx: r.hash });
+    tokens.push({ id: r.id, name: `Kemonokaki #${r.id}`, from: cur, time: r.time, tx: r.hash });
   }
   tokens.sort((a, b) => b.time - a.time || Number(a.id) - Number(b.id));
   return { owner, tokens };
@@ -221,7 +244,6 @@ function attachImg(img, t) {
 const fromHtml = t => !t.from ? `<span>unknown</span>`
   : t.from === ZERO ? `<span class="mint">Minted</span>`
   : `<a href="${addrUrl(t.from)}" target="_blank" rel="noopener" title="${t.from}">${t.from}</a>`;
-const viaHtml = t => t.via.map(a => `<a href="${addrUrl(a)}" target="_blank" rel="noopener" title="${a}">${short(a)}</a>`).join(" · ");
 const whenHtml = t => {
   const when = t.time ? new Date(t.time * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
   return t.tx ? `<a href="https://basescan.org/tx/${t.tx}" target="_blank" rel="noopener">${when}</a>` : when;
@@ -238,7 +260,6 @@ function renderGrid(shown) {
       <div class="body">
         <div class="name"><a href="${nftUrl(t.id)}" target="_blank" rel="noopener">#${t.id}</a></div>
         <div class="row"><span class="k">Previous owner</span><span class="v">${fromHtml(t)}</span></div>
-        ${t.via.length ? `<div class="row"><span class="k">Via contract</span><span class="v">${viaHtml(t)}</span></div>` : ""}
         <div class="row"><span class="k">Received</span><span class="v">${whenHtml(t)}</span></div>
       </div>`;
     attachImg(card.querySelector("img"), t);
@@ -250,7 +271,7 @@ function renderGrid(shown) {
 function renderList(shown) {
   const wrap = document.createElement("div");
   wrap.className = "table-wrap";
-  wrap.innerHTML = `<table><thead><tr><th></th><th>Token</th><th>Previous owner</th><th>Via contract</th><th>Received</th><th>BaseScan</th></tr></thead><tbody></tbody></table>`;
+  wrap.innerHTML = `<table><thead><tr><th></th><th>Token</th><th>Previous owner</th><th>Received</th><th>BaseScan</th></tr></thead><tbody></tbody></table>`;
   const body = wrap.querySelector("tbody");
   for (const t of shown) {
     const tr = document.createElement("tr");
@@ -258,7 +279,6 @@ function renderList(shown) {
       <td class="thumb"><img loading="lazy" alt="${t.name}"></td>
       <td class="id">#${t.id}</td>
       <td>${fromHtml(t)}</td>
-      <td>${viaHtml(t) || "—"}</td>
       <td>${whenHtml(t)}</td>
       <td><a href="${nftUrl(t.id)}" target="_blank" rel="noopener">View NFT</a></td>`;
     attachImg(tr.querySelector("img"), t);
@@ -342,6 +362,35 @@ $("prev").addEventListener("input", () => {
   const v = $("prev").value.trim();
   if (state && (!v || isAddr(v))) { $("prev").setAttribute("aria-invalid", "false"); syncUrl(); render(); }
 });
+function renderSkip() {
+  const list = $("skip-list");
+  list.innerHTML = "";
+  for (const a of skip) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.innerHTML = `<a href="${addrUrl(a)}" target="_blank" rel="noopener">${a}</a><button type="button" aria-label="Remove ${a}">×</button>`;
+    chip.querySelector("button").onclick = () => { skip.delete(a); skipChanged(); };
+    list.append(chip);
+  }
+}
+async function skipChanged() {
+  try { localStorage.setItem("skip", JSON.stringify([...skip])); } catch {}
+  renderSkip();
+  if (state) { state = compute(state.owner, await loadData()); render(); }
+}
+$("skip").addEventListener("submit", e => {
+  e.preventDefault();
+  const v = $("skip-add").value.trim();
+  const ok = isAddr(v);
+  $("skip-add").setAttribute("aria-invalid", String(!ok));
+  if (!ok) return;
+  skip.add(lc(v));
+  $("skip-add").value = "";
+  skipChanged();
+});
+$("skip-reset").onclick = () => { skip = new Set(DEFAULT_SKIP); skipChanged(); };
+renderSkip();
+
 $("view-grid").onclick = () => setView("grid");
 $("view-list").onclick = () => setView("list");
 setView(view);
