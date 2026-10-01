@@ -220,7 +220,7 @@ function attachImg(img, t) {
 
 const fromHtml = t => !t.from ? `<span>unknown</span>`
   : t.from === ZERO ? `<span class="mint">Minted</span>`
-  : `<a href="${addrUrl(t.from)}" target="_blank" rel="noopener" title="${t.from}">${short(t.from)}</a>`;
+  : `<a href="${addrUrl(t.from)}" target="_blank" rel="noopener" title="${t.from}">${t.from}</a>`;
 const viaHtml = t => t.via.map(a => `<a href="${addrUrl(a)}" target="_blank" rel="noopener" title="${a}">${short(a)}</a>`).join(" · ");
 const whenHtml = t => {
   const when = t.time ? new Date(t.time * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
@@ -284,7 +284,7 @@ function render() {
     const b = document.createElement("button");
     b.type = "button"; b.className = "chip";
     b.setAttribute("aria-pressed", String(lc(addr) === prev));
-    b.innerHTML = `${addr === ZERO ? "Minted" : short(addr)}<b>${c.n}</b>`;
+    b.innerHTML = `${addr === ZERO ? "Minted" : addr}<b>${c.n}</b>`;
     b.title = addr;
     b.onclick = () => {
       $("prev").value = lc(addr) === prev ? "" : addr;
